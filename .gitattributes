@@ -1,0 +1,8 @@
+* text=auto
+
+# Keep known binary assets binary-safe when tracked.
+*.exe binary
+*.pdf binary
+*.png binary
+*.jpg binary
+*.jpeg binary
