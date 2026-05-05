@@ -7,6 +7,7 @@ Dependencies:
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -18,7 +19,7 @@ from typing import List
 
 import customtkinter as ctk
 import fitz
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 from tkinter import filedialog, messagebox
 
 
@@ -27,6 +28,9 @@ class ProcessingRequest:
     pdf_path: Path
     pages_per_image: int
     layout_direction: str
+    horizontal_order: str
+    show_page_numbers: bool
+    page_number_font_size: int
     output_root: Path
     remove_large_spaces: bool
     cleanup_strength: float
@@ -40,6 +44,12 @@ class PDFStitcherApp(ctk.CTk):
     DEFAULT_PAGES_PER_IMAGE = 2
     DEFAULT_LAYOUT_DIRECTION = "Vertical"
     VALID_LAYOUT_DIRECTIONS = {"Vertical", "Horizontal"}
+    DEFAULT_HORIZONTAL_ORDER = "Right to left"
+    VALID_HORIZONTAL_ORDERS = {"Left to right", "Right to left"}
+    DEFAULT_SHOW_PAGE_NUMBERS = True
+    MIN_PAGE_NUMBER_FONT_SIZE = 8
+    MAX_PAGE_NUMBER_FONT_SIZE = 36
+    DEFAULT_PAGE_NUMBER_FONT_SIZE = 12
     DEFAULT_OUTPUT_ROOT = Path("F:/splitPdf")
 
     def __init__(self) -> None:
@@ -51,10 +61,14 @@ class PDFStitcherApp(ctk.CTk):
         self.resizable(True, True)
 
         self.default_output_root = self._resolve_default_output_root()
+        self.settings_path = self._resolve_settings_path()
 
         self.pdf_path_var = ctk.StringVar(value="No PDF selected")
         self.pages_per_image_var = ctk.StringVar(value=str(self.DEFAULT_PAGES_PER_IMAGE))
         self.layout_direction_var = ctk.StringVar(value=self.DEFAULT_LAYOUT_DIRECTION)
+        self.horizontal_order_var = ctk.StringVar(value=self.DEFAULT_HORIZONTAL_ORDER)
+        self.show_page_numbers_var = ctk.BooleanVar(value=self.DEFAULT_SHOW_PAGE_NUMBERS)
+        self.page_number_font_size_var = ctk.DoubleVar(value=float(self.DEFAULT_PAGE_NUMBER_FONT_SIZE))
         self.custom_output_var = ctk.BooleanVar(value=False)
         self.output_root_var = ctk.StringVar(value=str(self.default_output_root))
         self.default_output_note_var = ctk.StringVar(
@@ -63,17 +77,24 @@ class PDFStitcherApp(ctk.CTk):
         self.remove_spaces_var = ctk.BooleanVar(value=False)
         self.cleanup_strength_var = ctk.DoubleVar(value=50.0)
         self.cleanup_strength_label_var = ctk.StringVar(value="Whitespace cleanup strength: 50%")
+        self.page_number_font_size_label_var = ctk.StringVar(
+            value=f"Page number size: {self.DEFAULT_PAGE_NUMBER_FONT_SIZE}"
+        )
         self.status_var = ctk.StringVar(value="Select a PDF and choose your settings.")
 
         self.is_processing = False
         self.render_scale = 2.0
 
+        self._load_settings()
+        self._sync_setting_labels()
         self._build_ui()
+        self._setup_setting_traces()
         self.bind("<Configure>", self._on_window_resize)
 
     def _build_ui(self) -> None:
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=0)
 
         card_color = "#1C1C1E"
         primary_text = "#F5F5F7"
@@ -86,7 +107,7 @@ class PDFStitcherApp(ctk.CTk):
             scrollbar_button_color="#2F2F32",
             scrollbar_button_hover_color="#3A3A3C",
         )
-        main_frame.grid(row=0, column=0, sticky="nsew", padx=24, pady=24)
+        main_frame.grid(row=0, column=0, sticky="nsew", padx=24, pady=(24, 12))
         main_frame.grid_columnconfigure(0, weight=1)
 
         header_frame = ctk.CTkFrame(main_frame, corner_radius=0, fg_color="transparent")
@@ -180,7 +201,7 @@ class PDFStitcherApp(ctk.CTk):
             progress_color="#0A84FF",
         )
         self.pages_slider.grid(row=0, column=0, sticky="ew", padx=(0, 12))
-        self.pages_slider.set(self.DEFAULT_PAGES_PER_IMAGE)
+        self.pages_slider.set(self._parse_pages_per_image(self.pages_per_image_var.get()))
 
         self.pages_entry = ctk.CTkEntry(
             pages_row,
@@ -217,6 +238,66 @@ class PDFStitcherApp(ctk.CTk):
         direction_segmented.grid(row=4, column=0, sticky="w", padx=20, pady=(0, 18))
         direction_segmented.set(self.DEFAULT_LAYOUT_DIRECTION)
 
+        horizontal_order_label = ctk.CTkLabel(
+            settings_card,
+            text="Horizontal order",
+            font=("Segoe UI", 13),
+            text_color=secondary_text,
+        )
+        horizontal_order_label.grid(row=5, column=0, sticky="w", padx=20, pady=(0, 8))
+
+        horizontal_order_segmented = ctk.CTkSegmentedButton(
+            settings_card,
+            values=["Right to left", "Left to right"],
+            variable=self.horizontal_order_var,
+            height=34,
+            fg_color="#2C2C2E",
+            selected_color="#0A84FF",
+            selected_hover_color="#0071E3",
+            unselected_color="#2C2C2E",
+            unselected_hover_color="#3A3A3C",
+            font=("Segoe UI", 12, "bold"),
+        )
+        horizontal_order_segmented.grid(row=6, column=0, sticky="w", padx=20, pady=(0, 18))
+        horizontal_order_segmented.set(self.DEFAULT_HORIZONTAL_ORDER)
+
+        self.page_numbers_switch = ctk.CTkSwitch(
+            settings_card,
+            text="Show page numbers",
+            variable=self.show_page_numbers_var,
+            onvalue=True,
+            offvalue=False,
+            font=("Segoe UI", 13),
+            command=self._on_show_page_numbers_toggle,
+        )
+        self.page_numbers_switch.grid(row=7, column=0, sticky="w", padx=20, pady=(0, 18))
+
+        page_number_size_row = ctk.CTkFrame(settings_card, fg_color="transparent")
+        page_number_size_row.grid(row=8, column=0, sticky="ew", padx=20, pady=(0, 18))
+        page_number_size_row.grid_columnconfigure(0, weight=1)
+
+        self.page_number_font_size_label = ctk.CTkLabel(
+            page_number_size_row,
+            textvariable=self.page_number_font_size_label_var,
+            font=("Segoe UI", 12),
+            text_color=secondary_text,
+        )
+        self.page_number_font_size_label.grid(row=0, column=0, sticky="w", pady=(0, 6))
+
+        self.page_number_font_size_slider = ctk.CTkSlider(
+            page_number_size_row,
+            from_=self.MIN_PAGE_NUMBER_FONT_SIZE,
+            to=self.MAX_PAGE_NUMBER_FONT_SIZE,
+            number_of_steps=self.MAX_PAGE_NUMBER_FONT_SIZE - self.MIN_PAGE_NUMBER_FONT_SIZE,
+            variable=self.page_number_font_size_var,
+            command=self._on_page_number_font_size_change,
+            progress_color="#0A84FF",
+            button_color="#0A84FF",
+            button_hover_color="#0071E3",
+        )
+        self.page_number_font_size_slider.grid(row=1, column=0, sticky="ew")
+        self.page_number_font_size_slider.set(self.page_number_font_size_var.get())
+
         self.remove_spaces_switch = ctk.CTkSwitch(
             settings_card,
             text="Remove large empty spaces",
@@ -226,10 +307,10 @@ class PDFStitcherApp(ctk.CTk):
             font=("Segoe UI", 13),
             command=self._on_remove_spaces_toggle,
         )
-        self.remove_spaces_switch.grid(row=5, column=0, sticky="w", padx=20, pady=(0, 18))
+        self.remove_spaces_switch.grid(row=9, column=0, sticky="w", padx=20, pady=(0, 18))
 
         cleanup_strength_row = ctk.CTkFrame(settings_card, fg_color="transparent")
-        cleanup_strength_row.grid(row=6, column=0, sticky="ew", padx=20, pady=(0, 18))
+        cleanup_strength_row.grid(row=10, column=0, sticky="ew", padx=20, pady=(0, 18))
         cleanup_strength_row.grid_columnconfigure(0, weight=1)
 
         self.cleanup_strength_label = ctk.CTkLabel(
@@ -252,7 +333,7 @@ class PDFStitcherApp(ctk.CTk):
             button_hover_color="#0071E3",
         )
         self.cleanup_strength_slider.grid(row=1, column=0, sticky="ew")
-        self.cleanup_strength_slider.set(50)
+        self.cleanup_strength_slider.set(self.cleanup_strength_var.get())
 
         output_card = ctk.CTkFrame(main_frame, corner_radius=16, fg_color=card_color)
         output_card.grid(row=3, column=0, sticky="ew", padx=30, pady=(0, 16))
@@ -297,6 +378,8 @@ class PDFStitcherApp(ctk.CTk):
             font=("Segoe UI", 13),
         )
         self.output_entry.grid(row=0, column=0, sticky="ew", padx=(0, 12))
+        self.output_entry.bind("<Return>", self._on_output_entry_commit)
+        self.output_entry.bind("<FocusOut>", self._on_output_entry_commit)
 
         self.output_button = ctk.CTkButton(
             output_row,
@@ -310,8 +393,8 @@ class PDFStitcherApp(ctk.CTk):
         )
         self.output_button.grid(row=0, column=1, sticky="e")
 
-        footer_frame = ctk.CTkFrame(main_frame, corner_radius=0, fg_color="transparent")
-        footer_frame.grid(row=4, column=0, sticky="ew", padx=30, pady=(0, 24))
+        footer_frame = ctk.CTkFrame(self, corner_radius=0, fg_color="transparent")
+        footer_frame.grid(row=1, column=0, sticky="ew", padx=24, pady=(0, 24))
         footer_frame.grid_columnconfigure(0, weight=1)
 
         self.process_button = ctk.CTkButton(
@@ -347,6 +430,7 @@ class PDFStitcherApp(ctk.CTk):
 
         self._toggle_output_controls()
         self._on_remove_spaces_toggle()
+        self._on_show_page_numbers_toggle()
 
     def _on_window_resize(self, _event=None) -> None:
         dynamic_wrap = max(300, self.winfo_width() - 340)
@@ -355,6 +439,115 @@ class PDFStitcherApp(ctk.CTk):
     @classmethod
     def _resolve_default_output_root(cls) -> Path:
         return cls.DEFAULT_OUTPUT_ROOT
+
+    @staticmethod
+    def _resolve_settings_path() -> Path:
+        app_data_root = Path(os.environ.get("APPDATA", str(Path.home())))
+        return app_data_root / "PDFStitcher" / "settings.json"
+
+    def _load_settings(self) -> None:
+        if not self.settings_path.exists():
+            return
+
+        try:
+            raw_text = self.settings_path.read_text(encoding="utf-8")
+            data = json.loads(raw_text)
+        except (OSError, json.JSONDecodeError):
+            return
+
+        pages_value = data.get("pages_per_image")
+        if pages_value is not None:
+            self.pages_per_image_var.set(
+                str(self._parse_pages_per_image(str(pages_value)))
+            )
+
+        layout_direction = data.get("layout_direction")
+        if layout_direction in self.VALID_LAYOUT_DIRECTIONS:
+            self.layout_direction_var.set(layout_direction)
+
+        horizontal_order = data.get("horizontal_order")
+        if horizontal_order in self.VALID_HORIZONTAL_ORDERS:
+            self.horizontal_order_var.set(horizontal_order)
+
+        show_page_numbers = data.get("show_page_numbers")
+        if isinstance(show_page_numbers, bool):
+            self.show_page_numbers_var.set(show_page_numbers)
+
+        font_size_value = data.get("page_number_font_size")
+        if isinstance(font_size_value, (int, float)):
+            clamped_size = int(
+                min(
+                    max(int(round(font_size_value)), self.MIN_PAGE_NUMBER_FONT_SIZE),
+                    self.MAX_PAGE_NUMBER_FONT_SIZE,
+                )
+            )
+            self.page_number_font_size_var.set(float(clamped_size))
+
+        custom_output = data.get("custom_output")
+        if isinstance(custom_output, bool):
+            self.custom_output_var.set(custom_output)
+
+        output_root = data.get("output_root")
+        if isinstance(output_root, str) and output_root.strip():
+            self.output_root_var.set(output_root.strip())
+
+        remove_large_spaces = data.get("remove_large_spaces")
+        if isinstance(remove_large_spaces, bool):
+            self.remove_spaces_var.set(remove_large_spaces)
+
+        cleanup_strength = data.get("cleanup_strength")
+        if isinstance(cleanup_strength, (int, float)):
+            clamped_strength = min(max(float(cleanup_strength), 0.0), 100.0)
+            self.cleanup_strength_var.set(clamped_strength)
+
+    def _sync_setting_labels(self) -> None:
+        self._set_cleanup_strength(self.cleanup_strength_var.get())
+        self._set_page_number_font_size(self.page_number_font_size_var.get())
+
+    def _setup_setting_traces(self) -> None:
+        self.layout_direction_var.trace_add("write", lambda *_: self._persist_settings())
+        self.horizontal_order_var.trace_add("write", lambda *_: self._persist_settings())
+
+    def _persist_settings(self) -> None:
+        font_size = int(round(self.page_number_font_size_var.get()))
+        font_size = min(
+            max(font_size, self.MIN_PAGE_NUMBER_FONT_SIZE),
+            self.MAX_PAGE_NUMBER_FONT_SIZE,
+        )
+        data = {
+            "pages_per_image": self._parse_pages_per_image(self.pages_per_image_var.get()),
+            "layout_direction": self._validated_layout_direction(),
+            "horizontal_order": self._validated_horizontal_order(),
+            "show_page_numbers": bool(self.show_page_numbers_var.get()),
+            "page_number_font_size": font_size,
+            "custom_output": bool(self.custom_output_var.get()),
+            "output_root": self.output_root_var.get().strip(),
+            "remove_large_spaces": bool(self.remove_spaces_var.get()),
+            "cleanup_strength": float(self.cleanup_strength_var.get()),
+        }
+
+        try:
+            self.settings_path.parent.mkdir(parents=True, exist_ok=True)
+            self.settings_path.write_text(
+                json.dumps(data, indent=2),
+                encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    def _set_cleanup_strength(self, value: float) -> None:
+        rounded_value = int(round(value))
+        self.cleanup_strength_var.set(float(rounded_value))
+        self.cleanup_strength_label_var.set(f"Whitespace cleanup strength: {rounded_value}%")
+
+    def _set_page_number_font_size(self, value: float) -> None:
+        rounded_value = int(round(value))
+        clamped_value = min(
+            max(rounded_value, self.MIN_PAGE_NUMBER_FONT_SIZE),
+            self.MAX_PAGE_NUMBER_FONT_SIZE,
+        )
+        self.page_number_font_size_var.set(float(clamped_value))
+        self.page_number_font_size_label_var.set(f"Page number size: {clamped_value}")
 
     @classmethod
     def _clamp_pages_per_image(cls, value: int) -> int:
@@ -374,6 +567,12 @@ class PDFStitcherApp(ctk.CTk):
             return self.DEFAULT_LAYOUT_DIRECTION
         return current_direction
 
+    def _validated_horizontal_order(self) -> str:
+        current_order = self.horizontal_order_var.get()
+        if current_order not in self.VALID_HORIZONTAL_ORDERS:
+            return self.DEFAULT_HORIZONTAL_ORDER
+        return current_order
+
     def choose_pdf(self) -> None:
         selected_file = filedialog.askopenfilename(
             title="Select PDF",
@@ -387,6 +586,7 @@ class PDFStitcherApp(ctk.CTk):
         selected_dir = filedialog.askdirectory(title="Choose output destination")
         if selected_dir:
             self.output_root_var.set(selected_dir)
+            self._persist_settings()
 
     def _toggle_output_controls(self) -> None:
         is_custom = self.custom_output_var.get()
@@ -394,24 +594,40 @@ class PDFStitcherApp(ctk.CTk):
         self.output_button.configure(state="normal" if is_custom else "disabled")
         if not is_custom:
             self.output_root_var.set(str(self.default_output_root))
+        self._persist_settings()
 
     def _on_remove_spaces_toggle(self) -> None:
         slider_state = "normal" if self.remove_spaces_var.get() else "disabled"
         self.cleanup_strength_slider.configure(state=slider_state)
+        self._persist_settings()
+
+    def _on_show_page_numbers_toggle(self) -> None:
+        slider_state = "normal" if self.show_page_numbers_var.get() else "disabled"
+        self.page_number_font_size_slider.configure(state=slider_state)
+        self._persist_settings()
 
     def _on_cleanup_strength_change(self, value: float) -> None:
-        rounded_value = int(round(value))
-        self.cleanup_strength_var.set(float(rounded_value))
-        self.cleanup_strength_label_var.set(f"Whitespace cleanup strength: {rounded_value}%")
+        self._set_cleanup_strength(value)
+        self._persist_settings()
+
+    def _on_page_number_font_size_change(self, value: float) -> None:
+        self._set_page_number_font_size(value)
+        self._persist_settings()
 
     def _on_slider_change(self, value: float) -> None:
         rounded_value = self._clamp_pages_per_image(int(round(value)))
         self.pages_per_image_var.set(str(rounded_value))
+        self._persist_settings()
 
     def _on_pages_entry_commit(self, _event=None) -> None:
         validated_value = self._parse_pages_per_image(self.pages_per_image_var.get())
         self.pages_per_image_var.set(str(validated_value))
         self.pages_slider.set(validated_value)
+        self._persist_settings()
+
+    def _on_output_entry_commit(self, _event=None) -> None:
+        self.output_root_var.set(self.output_root_var.get().strip())
+        self._persist_settings()
 
     def start_processing(self) -> None:
         if self.is_processing:
@@ -426,6 +642,13 @@ class PDFStitcherApp(ctk.CTk):
         self._on_pages_entry_commit()
         pages_per_image = self._parse_pages_per_image(self.pages_per_image_var.get())
         layout_direction = self._validated_layout_direction()
+        horizontal_order = self._validated_horizontal_order()
+        show_page_numbers = self.show_page_numbers_var.get()
+        page_number_font_size = int(round(self.page_number_font_size_var.get()))
+        page_number_font_size = min(
+            max(page_number_font_size, self.MIN_PAGE_NUMBER_FONT_SIZE),
+            self.MAX_PAGE_NUMBER_FONT_SIZE,
+        )
         remove_large_spaces = self.remove_spaces_var.get()
         cleanup_strength = self.cleanup_strength_var.get() / 100.0
 
@@ -451,6 +674,9 @@ class PDFStitcherApp(ctk.CTk):
             pdf_path=pdf_path,
             pages_per_image=pages_per_image,
             layout_direction=layout_direction,
+            horizontal_order=horizontal_order,
+            show_page_numbers=show_page_numbers,
+            page_number_font_size=page_number_font_size,
             output_root=output_root,
             remove_large_spaces=remove_large_spaces,
             cleanup_strength=cleanup_strength,
@@ -695,6 +921,49 @@ class PDFStitcherApp(ctk.CTk):
 
         return output_image
 
+    @staticmethod
+    def _load_page_number_font(font_size: int) -> ImageFont.ImageFont:
+        requested_size = max(6, font_size)
+        candidates = []
+        if sys.platform.startswith("win"):
+            windows_fonts = Path(os.environ.get("WINDIR", "C:/Windows")) / "Fonts"
+            candidates.extend(
+                [
+                    windows_fonts / "segoeui.ttf",
+                    windows_fonts / "arial.ttf",
+                ]
+            )
+
+        candidates.extend(["segoeui.ttf", "arial.ttf", "DejaVuSans.ttf"])
+
+        for candidate in candidates:
+            try:
+                return ImageFont.truetype(str(candidate), size=requested_size)
+            except OSError:
+                continue
+
+        return ImageFont.load_default()
+
+    @staticmethod
+    def _draw_page_number(image: Image.Image, page_number: int, font_size: int) -> None:
+        draw = ImageDraw.Draw(image)
+        font = PDFStitcherApp._load_page_number_font(font_size)
+        text = str(page_number)
+        try:
+            left, top, right, bottom = draw.textbbox((0, 0), text, font=font)
+            text_width = right - left
+            text_height = bottom - top
+        except AttributeError:
+            text_width, text_height = draw.textsize(text, font=font)
+
+        margin = 6
+        x_pos = max(0, image.width - text_width - margin)
+        y_pos = max(0, margin)
+        if y_pos + text_height > image.height:
+            y_pos = max(0, image.height - text_height - margin)
+
+        draw.text((x_pos, y_pos), text, fill="black", font=font)
+
     def convert_pdf_to_combined_images(self, request: ProcessingRequest) -> tuple[Path, int]:
         if request.layout_direction not in self.VALID_LAYOUT_DIRECTIONS:
             raise ValueError(f"Unsupported layout direction: {request.layout_direction}")
@@ -733,16 +1002,27 @@ class PDFStitcherApp(ctk.CTk):
                             pixmap.samples,
                         )
                         if request.remove_large_spaces:
-                            optimized_image = self.remove_large_empty_spaces(
+                            processed_image = self.remove_large_empty_spaces(
                                 rendered_image,
                                 request.cleanup_strength,
                             )
                             rendered_image.close()
-                            page_images.append(optimized_image)
                         else:
-                            page_images.append(rendered_image)
+                            processed_image = rendered_image
 
-                    stitched_image = self.stitch_images(page_images, request.layout_direction)
+                        if request.show_page_numbers:
+                            self._draw_page_number(
+                                processed_image,
+                                page_number + 1,
+                                request.page_number_font_size,
+                            )
+                        page_images.append(processed_image)
+
+                    stitched_image = self.stitch_images(
+                        page_images,
+                        request.layout_direction,
+                        request.horizontal_order,
+                    )
                     output_image_path = output_folder / f"{request.pdf_path.stem}_{image_index:03d}.png"
                     stitched_image.save(output_image_path, format="PNG")
 
@@ -759,17 +1039,28 @@ class PDFStitcherApp(ctk.CTk):
         return output_folder, generated_count
 
     @staticmethod
-    def stitch_images(images: List[Image.Image], layout_direction: str) -> Image.Image:
+    def stitch_images(
+        images: List[Image.Image],
+        layout_direction: str,
+        horizontal_order: str,
+    ) -> Image.Image:
         if not images:
             raise ValueError("No images available for stitching.")
 
         if layout_direction == "Horizontal":
-            combined_width = sum(image.width for image in images)
-            combined_height = max(image.height for image in images)
+            if horizontal_order not in PDFStitcherApp.VALID_HORIZONTAL_ORDERS:
+                horizontal_order = PDFStitcherApp.DEFAULT_HORIZONTAL_ORDER
+
+            ordered_images = images
+            if horizontal_order == "Right to left":
+                ordered_images = list(reversed(images))
+
+            combined_width = sum(image.width for image in ordered_images)
+            combined_height = max(image.height for image in ordered_images)
             combined_image = Image.new("RGB", (combined_width, combined_height), "white")
 
             current_x = 0
-            for image in images:
+            for image in ordered_images:
                 y_offset = (combined_height - image.height) // 2
                 combined_image.paste(image, (current_x, y_offset))
                 current_x += image.width
